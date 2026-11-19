@@ -1,0 +1,1001 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: default deny everything
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Global Helpers
+    // -------------------------------------------------------------------------
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() && request.auth.token.email == 'prajwalm1122@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() || (
+        isVerifiedUser() && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isBoundedString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    function isBoundedList(val, maxLen) {
+      return val is list && val.size() <= maxLen;
+    }
+
+    function isNotSuspended() {
+      return isBootstrappedAdmin()
+        || !exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        || !('accountStatus' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data)
+        || get(/databases/$(database)/documents/users/$(request.auth.uid)).data.accountStatus != 'suspended';
+    }
+
+    // -------------------------------------------------------------------------
+    // Validation Blueprints
+    // -------------------------------------------------------------------------
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'email', 'role', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly([
+          'uid', 'displayName', 'email', 'role', 'accountStatus',
+          'phone', 'address', 'photoURL', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.uid)
+        && isBoundedString(data.displayName, 1, 100)
+        && isBoundedString(data.email, 3, 150)
+        && data.role in ['customer', 'technician', 'admin']
+        && (!data.keys().hasAny(['accountStatus']) || data.accountStatus in ['active', 'suspended'])
+        && (!data.keys().hasAny(['phone']) || isBoundedString(data.phone, 0, 30))
+        && (!data.keys().hasAny(['address']) || isBoundedString(data.address, 0, 250))
+        && (!data.keys().hasAny(['photoURL']) || isBoundedString(data.photoURL, 0, 500))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidTechnician(data) {
+      return data.keys().hasAll([
+          'uid', 'displayName', 'serviceCategories', 'skills', 'experienceYears',
+          'serviceArea', 'availabilityStatus', 'verificationStatus', 'ratingAvg',
+          'completedJobs', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid', 'displayName', 'bio', 'serviceCategories', 'skills', 'experienceYears',
+          'serviceArea', 'availabilityStatus', 'verificationStatus', 'ratingAvg',
+          'completedJobs', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.uid)
+        && isBoundedString(data.displayName, 1, 100)
+        && (!data.keys().hasAny(['bio']) || isBoundedString(data.bio, 0, 1000))
+        && isBoundedList(data.serviceCategories, 10)
+        && (data.serviceCategories.size() == 0 || data.serviceCategories[0] is string)
+        && isBoundedList(data.skills, 15)
+        && (data.skills.size() == 0 || data.skills[0] is string)
+        && data.experienceYears is number && data.experienceYears >= 0 && data.experienceYears <= 80
+        && isBoundedString(data.serviceArea, 1, 120)
+        && data.availabilityStatus in ['available', 'busy', 'offline']
+        && data.verificationStatus in ['pending', 'verified', 'rejected', 'suspended']
+        && data.ratingAvg is number && data.ratingAvg >= 0 && data.ratingAvg <= 5
+        && data.completedJobs is number && data.completedJobs >= 0 && data.completedJobs <= 100000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidRepairRequest(data) {
+      return data.keys().hasAll([
+          'id', 'customerId', 'customerName', 'applianceCategory',
+          'symptomSummary', 'symptomDetails', 'imageUrls', 'status',
+          'riskLevel', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'customerId', 'customerName', 'applianceCategory',
+          'applianceBrand', 'applianceModel', 'symptomSummary', 'symptomDetails',
+          'imageUrls', 'status', 'assignedTechnicianId', 'latestDiagnosisId',
+          'riskLevel', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.customerId)
+        && isBoundedString(data.customerName, 1, 100)
+        && data.applianceCategory in [
+          'refrigerator', 'washing_machine', 'air_conditioner',
+          'laptop', 'television', 'microwave', 'other'
+        ]
+        && (!data.keys().hasAny(['applianceBrand']) || isBoundedString(data.applianceBrand, 0, 80))
+        && (!data.keys().hasAny(['applianceModel']) || isBoundedString(data.applianceModel, 0, 80))
+        && isBoundedString(data.symptomSummary, 3, 300)
+        && isBoundedString(data.symptomDetails, 0, 3000)
+        && isBoundedList(data.imageUrls, 5)
+        && (data.imageUrls.size() == 0 || data.imageUrls[0] is string)
+        && data.status in ['draft', 'diagnosed', 'technician_requested', 'booked', 'in_progress', 'completed', 'cancelled']
+        && (!data.keys().hasAny(['assignedTechnicianId']) || isBoundedString(data.assignedTechnicianId, 0, 128))
+        && (!data.keys().hasAny(['latestDiagnosisId']) || isBoundedString(data.latestDiagnosisId, 0, 128))
+        && data.riskLevel in ['low', 'medium', 'high', 'critical']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidDiagnosis(data) {
+      return data.keys().hasAll([
+          'id', 'requestId', 'customerId', 'applianceCategory', 'observations',
+          'matchedKnowledgeIds', 'hypotheses', 'recommendedSteps', 'riskLevel',
+          'confidenceScore', 'requiresProfessional', 'engineMode', 'summary',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'requestId', 'customerId', 'applianceCategory', 'observations',
+          'imageObservations', 'userSymptoms', 'imageUrls', 'matchedKnowledgeIds',
+          'hypotheses', 'followUpQuestions', 'missingEvidence', 'contradictoryEvidence',
+          'inferenceTrace', 'bfsSearchPath', 'bfsExploredLevels', 'recommendedSteps',
+          'safetyWarnings', 'riskLevel', 'urgencyLevel', 'nextRecommendedAction',
+          'confidenceScore', 'requiresProfessional', 'engineMode', 'summary',
+          'followUpConversation', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.requestId)
+        && isValidId(data.customerId)
+        && isBoundedString(data.applianceCategory, 2, 60)
+        && isBoundedList(data.observations, 25)
+        && (data.observations.size() == 0 || data.observations[0] is string)
+        && (!data.keys().hasAny(['imageObservations']) || (isBoundedList(data.imageObservations, 15) && (data.imageObservations.size() == 0 || data.imageObservations[0] is string)))
+        && (!data.keys().hasAny(['userSymptoms']) || (isBoundedList(data.userSymptoms, 20) && (data.userSymptoms.size() == 0 || data.userSymptoms[0] is string)))
+        && (!data.keys().hasAny(['imageUrls']) || (isBoundedList(data.imageUrls, 5) && (data.imageUrls.size() == 0 || data.imageUrls[0] is string)))
+        && isBoundedList(data.matchedKnowledgeIds, 15)
+        && (data.matchedKnowledgeIds.size() == 0 || data.matchedKnowledgeIds[0] is string)
+        && isBoundedList(data.hypotheses, 10)
+        && (!data.keys().hasAny(['followUpQuestions']) || (isBoundedList(data.followUpQuestions, 10) && (data.followUpQuestions.size() == 0 || data.followUpQuestions[0] is string)))
+        && (!data.keys().hasAny(['missingEvidence']) || (isBoundedList(data.missingEvidence, 15) && (data.missingEvidence.size() == 0 || data.missingEvidence[0] is string)))
+        && (!data.keys().hasAny(['contradictoryEvidence']) || (isBoundedList(data.contradictoryEvidence, 10) && (data.contradictoryEvidence.size() == 0 || data.contradictoryEvidence[0] is string)))
+        && (!data.keys().hasAny(['inferenceTrace']) || isBoundedList(data.inferenceTrace, 25))
+        && (!data.keys().hasAny(['bfsSearchPath']) || isBoundedList(data.bfsSearchPath, 20))
+        && (!data.keys().hasAny(['bfsExploredLevels']) || isBoundedList(data.bfsExploredLevels, 10))
+        && isBoundedList(data.recommendedSteps, 15)
+        && (data.recommendedSteps.size() == 0 || data.recommendedSteps[0] is string)
+        && (!data.keys().hasAny(['safetyWarnings']) || (isBoundedList(data.safetyWarnings, 10) && (data.safetyWarnings.size() == 0 || data.safetyWarnings[0] is string)))
+        && data.riskLevel in ['low', 'medium', 'high', 'critical']
+        && (!data.keys().hasAny(['urgencyLevel']) || data.urgencyLevel in ['routine', 'soon', 'urgent', 'emergency'])
+        && (!data.keys().hasAny(['nextRecommendedAction']) || data.nextRecommendedAction in [
+          'safe_external_checks', 'ask_follow_up_questions', 'continue_diagnosis',
+          'stop_using_appliance', 'contact_qualified_technician'
+        ])
+        && data.confidenceScore is number && data.confidenceScore >= 0 && data.confidenceScore <= 1
+        && data.requiresProfessional is bool
+        && data.engineMode in ['phase1_deterministic_stub', 'gemini_hybrid']
+        && isBoundedString(data.summary, 5, 2000)
+        && (!data.keys().hasAny(['followUpConversation']) || isBoundedList(data.followUpConversation, 30))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBooking(data) {
+      return data.keys().hasAll([
+          'id', 'requestId', 'customerId', 'technicianId', 'customerName',
+          'technicianName', 'applianceCategory', 'scheduledDate', 'timeSlot',
+          'serviceAddress', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'requestId', 'diagnosisId', 'diagnosisSharedWithPermission',
+          'sharedDiagnosisSummary', 'customerId', 'technicianId', 'customerName',
+          'technicianName', 'applianceCategory', 'scheduledDate', 'timeSlot',
+          'slotKey', 'serviceAddress', 'status', 'notes', 'rejectionReason',
+          'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.requestId)
+        && (!data.keys().hasAny(['diagnosisId']) || isBoundedString(data.diagnosisId, 0, 128))
+        && (!data.keys().hasAny(['diagnosisSharedWithPermission']) || data.diagnosisSharedWithPermission is bool)
+        && (!data.keys().hasAny(['sharedDiagnosisSummary']) || isBoundedString(data.sharedDiagnosisSummary, 0, 2000))
+        && isValidId(data.customerId)
+        && isValidId(data.technicianId)
+        && isBoundedString(data.customerName, 1, 100)
+        && isBoundedString(data.technicianName, 1, 100)
+        && isBoundedString(data.applianceCategory, 2, 60)
+        && isBoundedString(data.scheduledDate, 8, 40)
+        && isBoundedString(data.timeSlot, 3, 60)
+        && (!data.keys().hasAny(['slotKey']) || isBoundedString(data.slotKey, 0, 128))
+        && isBoundedString(data.serviceAddress, 5, 250)
+        && data.status in [
+          'requested', 'pending', 'accepted', 'rejected',
+          'quotation_submitted', 'confirmed', 'in_progress', 'completed', 'cancelled'
+        ]
+        && (!data.keys().hasAny(['notes']) || isBoundedString(data.notes, 0, 1000))
+        && (!data.keys().hasAny(['rejectionReason']) || isBoundedString(data.rejectionReason, 0, 500))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBookingSlotLock(data) {
+      return data.keys().hasAll([
+          'id', 'bookingId', 'technicianId', 'customerId',
+          'scheduledDate', 'timeSlot', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'bookingId', 'technicianId', 'customerId',
+          'scheduledDate', 'timeSlot', 'status', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.bookingId)
+        && isValidId(data.technicianId)
+        && isValidId(data.customerId)
+        && isBoundedString(data.scheduledDate, 8, 40)
+        && isBoundedString(data.timeSlot, 3, 60)
+        && data.status in ['reserved', 'released']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidQuotation(data) {
+      return data.keys().hasAll([
+          'id', 'requestId', 'customerId', 'technicianId', 'estimatedCost',
+          'currency', 'partsDescription', 'laborDescription', 'status',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'requestId', 'bookingId', 'customerId', 'technicianId',
+          'technicianName', 'laborCharge', 'partsCost', 'additionalCharges',
+          'estimatedCost', 'currency', 'estimatedCompletionTime',
+          'proposedWorkDescription', 'partsDescription', 'laborDescription',
+          'status', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.requestId)
+        && (!data.keys().hasAny(['bookingId']) || isBoundedString(data.bookingId, 0, 128))
+        && isValidId(data.customerId)
+        && isValidId(data.technicianId)
+        && (!data.keys().hasAny(['technicianName']) || isBoundedString(data.technicianName, 1, 100))
+        && (!data.keys().hasAny(['laborCharge']) || (data.laborCharge is number && data.laborCharge >= 0 && data.laborCharge <= 1000000))
+        && (!data.keys().hasAny(['partsCost']) || (data.partsCost is number && data.partsCost >= 0 && data.partsCost <= 1000000))
+        && (!data.keys().hasAny(['additionalCharges']) || (data.additionalCharges is number && data.additionalCharges >= 0 && data.additionalCharges <= 1000000))
+        && data.estimatedCost is number && data.estimatedCost >= 0 && data.estimatedCost <= 1000000
+        && data.currency in ['USD', 'INR']
+        && (!data.keys().hasAny(['estimatedCompletionTime']) || isBoundedString(data.estimatedCompletionTime, 1, 100))
+        && (!data.keys().hasAny(['proposedWorkDescription']) || isBoundedString(data.proposedWorkDescription, 2, 1000))
+        && isBoundedString(data.partsDescription, 2, 500)
+        && isBoundedString(data.laborDescription, 2, 500)
+        && data.status in ['pending', 'accepted', 'rejected', 'expired']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidReview(data) {
+      return data.keys().hasAll([
+          'id', 'bookingId', 'customerId', 'technicianId',
+          'customerName', 'rating', 'comment', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'bookingId', 'customerId', 'technicianId',
+          'customerName', 'rating', 'comment', 'technicianResponse',
+          'technicianRespondedAt', 'createdAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.bookingId)
+        && isValidId(data.customerId)
+        && isValidId(data.technicianId)
+        && isBoundedString(data.customerName, 1, 100)
+        && data.rating is number && data.rating >= 1 && data.rating <= 5
+        && isBoundedString(data.comment, 3, 1000)
+        && (!data.keys().hasAny(['technicianResponse']) || isBoundedString(data.technicianResponse, 2, 800))
+        && (!data.keys().hasAny(['technicianRespondedAt']) || data.technicianRespondedAt is timestamp)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll(['id', 'userId', 'title', 'message', 'type', 'read', 'createdAt'])
+        && data.keys().hasOnly([
+          'id', 'userId', 'senderId', 'relatedBookingId', 'relatedRequestId',
+          'title', 'message', 'type', 'read', 'linkPath', 'createdAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.userId)
+        && (!data.keys().hasAny(['senderId']) || isBoundedString(data.senderId, 1, 128))
+        && (!data.keys().hasAny(['relatedBookingId']) || isBoundedString(data.relatedBookingId, 1, 128))
+        && (!data.keys().hasAny(['relatedRequestId']) || isBoundedString(data.relatedRequestId, 1, 128))
+        && isBoundedString(data.title, 2, 140)
+        && isBoundedString(data.message, 2, 500)
+        && data.type in ['info', 'diagnosis', 'booking', 'quotation', 'review', 'verification', 'alert']
+        && data.read is bool
+        && (!data.keys().hasAny(['linkPath']) || isBoundedString(data.linkPath, 0, 200))
+        && data.createdAt is timestamp;
+    }
+
+    function isValidComplaint(data) {
+      return data.keys().hasAll([
+          'id', 'reporterId', 'reporterName', 'reporterRole',
+          'category', 'subject', 'description', 'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'reporterId', 'reporterName', 'reporterRole', 'bookingId',
+          'technicianId', 'category', 'subject', 'description', 'status',
+          'adminNotes', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.reporterId)
+        && isBoundedString(data.reporterName, 1, 100)
+        && data.reporterRole in ['customer', 'technician', 'admin']
+        && (!data.keys().hasAny(['bookingId']) || isBoundedString(data.bookingId, 0, 128))
+        && (!data.keys().hasAny(['technicianId']) || isBoundedString(data.technicianId, 0, 128))
+        && data.category in ['service_quality', 'pricing_dispute', 'safety_concern', 'no_show', 'other']
+        && isBoundedString(data.subject, 3, 180)
+        && isBoundedString(data.description, 10, 2000)
+        && data.status in ['open', 'investigating', 'resolved', 'dismissed']
+        && (!data.keys().hasAny(['adminNotes']) || isBoundedString(data.adminNotes, 0, 1000))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidApplianceCategory(data) {
+      return data.keys().hasAll(['id', 'slug', 'name', 'description', 'commonFaultsCount', 'isActive', 'safetyNotice', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'slug', 'name', 'description', 'commonFaultsCount', 'isActive', 'safetyNotice', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.slug is string && data.slug.size() >= 2 && data.slug.size() <= 60 && data.slug.matches('^[a-z0-9_]+$')
+        && isBoundedString(data.name, 2, 80)
+        && isBoundedString(data.description, 5, 500)
+        && data.commonFaultsCount is number && data.commonFaultsCount >= 0 && data.commonFaultsCount <= 10000
+        && data.isActive is bool
+        && isBoundedString(data.safetyNotice, 5, 400)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidKnowledgeBaseEntry(data) {
+      return data.keys().hasAll([
+          'id', 'applianceCategory', 'faultTitle', 'observableSymptoms',
+          'possibleCauses', 'followUpQuestions', 'safeTroubleshootingSteps',
+          'riskLevel', 'requiresProfessional', 'isSampleData', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'applianceCategory', 'faultTitle', 'observableSymptoms',
+          'possibleCauses', 'followUpQuestions', 'safeTroubleshootingSteps',
+          'riskLevel', 'requiresProfessional', 'isSampleData', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isBoundedString(data.applianceCategory, 2, 60)
+        && isBoundedString(data.faultTitle, 3, 160)
+        && isBoundedList(data.observableSymptoms, 20)
+        && (data.observableSymptoms.size() == 0 || data.observableSymptoms[0] is string)
+        && isBoundedList(data.possibleCauses, 15)
+        && (data.possibleCauses.size() == 0 || data.possibleCauses[0] is string)
+        && isBoundedList(data.followUpQuestions, 10)
+        && (data.followUpQuestions.size() == 0 || data.followUpQuestions[0] is string)
+        && isBoundedList(data.safeTroubleshootingSteps, 15)
+        && (data.safeTroubleshootingSteps.size() == 0 || data.safeTroubleshootingSteps[0] is string)
+        && data.riskLevel in ['low', 'medium', 'high', 'critical']
+        && data.requiresProfessional is bool
+        && data.isSampleData is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidContactInquiry(data) {
+      return data.keys().hasAll(['id', 'name', 'email', 'subject', 'message', 'status', 'createdAt'])
+        && data.keys().hasOnly(['id', 'name', 'email', 'subject', 'message', 'userId', 'status', 'createdAt'])
+        && isValidId(data.id)
+        && isBoundedString(data.name, 2, 100)
+        && isBoundedString(data.email, 3, 150)
+        && isBoundedString(data.subject, 3, 180)
+        && isBoundedString(data.message, 10, 2000)
+        && (!data.keys().hasAny(['userId']) || isBoundedString(data.userId, 0, 128))
+        && data.status in ['new', 'reviewed']
+        && data.createdAt is timestamp;
+    }
+
+    function isValidCrossUserNotification() {
+      return incoming().keys().hasAny(['senderId'])
+        && incoming().senderId == request.auth.uid
+        && (
+          (
+            incoming().keys().hasAny(['relatedBookingId'])
+            && exists(/databases/$(database)/documents/bookings/$(incoming().relatedBookingId))
+            && (
+              (
+                get(/databases/$(database)/documents/bookings/$(incoming().relatedBookingId)).data.customerId == request.auth.uid
+                && get(/databases/$(database)/documents/bookings/$(incoming().relatedBookingId)).data.technicianId == incoming().userId
+              )
+              || (
+                get(/databases/$(database)/documents/bookings/$(incoming().relatedBookingId)).data.technicianId == request.auth.uid
+                && get(/databases/$(database)/documents/bookings/$(incoming().relatedBookingId)).data.customerId == incoming().userId
+              )
+            )
+          )
+          || (
+            incoming().keys().hasAny(['relatedRequestId'])
+            && exists(/databases/$(database)/documents/repairRequests/$(incoming().relatedRequestId))
+            && get(/databases/$(database)/documents/repairRequests/$(incoming().relatedRequestId)).data.customerId == incoming().userId
+            && exists(/databases/$(database)/documents/technicians/$(request.auth.uid))
+            && get(/databases/$(database)/documents/technicians/$(request.auth.uid)).data.verificationStatus == 'verified'
+          )
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Collection Rules
+    // -------------------------------------------------------------------------
+
+    match /test/connection {
+      allow get: if true;
+    }
+
+    match /admins/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isBootstrappedAdmin();
+      allow create, update, delete: if isValidId(userId) && isAdmin();
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.uid == request.auth.uid);
+
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUser(incoming())
+        && incoming().uid == request.auth.uid
+        && incoming().uid == userId
+        && (!incoming().keys().hasAny(['accountStatus']) || incoming().accountStatus == 'active')
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          incoming().role in ['customer', 'technician']
+          || (incoming().role == 'admin' && isBootstrappedAdmin())
+        );
+
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && isValidUser(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            isOwner(userId)
+            && isNotSuspended()
+            && incoming().role == existing().role
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'phone', 'address', 'photoURL', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isValidId(userId) && isAdmin();
+    }
+
+    match /technicians/{technicianId} {
+      allow get: if isValidId(technicianId) && (
+        existing().verificationStatus == 'verified' || isOwner(technicianId) || isAdmin()
+      );
+      allow list: if isBootstrappedAdmin()
+        || resource.data.verificationStatus == 'verified'
+        || (isSignedIn() && resource.data.uid == request.auth.uid);
+
+      allow create: if isVerifiedUser()
+        && isValidId(technicianId)
+        && isValidTechnician(incoming())
+        && incoming().uid == technicianId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          (
+            isAdmin()
+            && incoming().verificationStatus in ['pending', 'verified']
+          )
+          || (
+            incoming().uid == request.auth.uid
+            && incoming().verificationStatus == 'pending'
+            && incoming().ratingAvg == 0
+            && incoming().completedJobs == 0
+            && isNotSuspended()
+          )
+        );
+
+      allow update: if isVerifiedUser()
+        && isValidId(technicianId)
+        && isValidTechnician(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            isOwner(technicianId)
+            && isNotSuspended()
+            && existing().verificationStatus != 'suspended'
+            && incoming().verificationStatus == existing().verificationStatus
+            && incoming().ratingAvg == existing().ratingAvg
+            && incoming().completedJobs == existing().completedJobs
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'displayName', 'bio', 'serviceCategories', 'skills',
+              'experienceYears', 'serviceArea', 'availabilityStatus', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isValidId(technicianId) && isAdmin();
+    }
+
+    match /repairRequests/{requestId} {
+      allow get: if isValidId(requestId) && isSignedIn() && (
+        existing().customerId == request.auth.uid
+        || existing().assignedTechnicianId == request.auth.uid
+        || existing().status == 'technician_requested'
+        || isAdmin()
+      );
+
+      allow list: if isBootstrappedAdmin() || (
+        isSignedIn() && (
+          resource.data.customerId == request.auth.uid
+          || resource.data.assignedTechnicianId == request.auth.uid
+          || resource.data.status == 'technician_requested'
+        )
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(requestId)
+        && isValidRepairRequest(incoming())
+        && incoming().id == requestId
+        && incoming().customerId == request.auth.uid
+        && incoming().status in ['draft', 'diagnosed', 'technician_requested']
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isNotSuspended();
+
+      allow update: if isVerifiedUser()
+        && isValidId(requestId)
+        && isValidRepairRequest(incoming())
+        && incoming().id == existing().id
+        && incoming().customerId == existing().customerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            isNotSuspended()
+            && !(existing().status in ['completed', 'cancelled'])
+            && (
+              (
+                existing().customerId == request.auth.uid
+                && incoming().diff(existing()).affectedKeys().hasOnly([
+                  'applianceBrand', 'applianceModel', 'symptomSummary', 'symptomDetails',
+                  'imageUrls', 'status', 'latestDiagnosisId', 'riskLevel', 'assignedTechnicianId', 'updatedAt'
+                ])
+              )
+              || (
+                existing().assignedTechnicianId == request.auth.uid
+                && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+                && incoming().status in ['in_progress', 'completed']
+              )
+            )
+          )
+        );
+
+      allow delete: if isValidId(requestId) && isAdmin();
+    }
+
+    match /diagnoses/{diagnosisId} {
+      allow get: if isValidId(diagnosisId) && isSignedIn() && (
+        existing().customerId == request.auth.uid || isAdmin()
+      );
+      allow list: if isBootstrappedAdmin() || (
+        isSignedIn() && resource.data.customerId == request.auth.uid
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(diagnosisId)
+        && isValidDiagnosis(incoming())
+        && incoming().id == diagnosisId
+        && incoming().customerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isNotSuspended()
+        && exists(/databases/$(database)/documents/repairRequests/$(incoming().requestId))
+        && get(/databases/$(database)/documents/repairRequests/$(incoming().requestId)).data.customerId == request.auth.uid;
+
+      allow update: if isVerifiedUser()
+        && isValidId(diagnosisId)
+        && isValidDiagnosis(incoming())
+        && incoming().id == existing().id
+        && incoming().requestId == existing().requestId
+        && incoming().customerId == existing().customerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            isNotSuspended()
+            && existing().customerId == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'observations', 'imageObservations', 'userSymptoms', 'matchedKnowledgeIds',
+              'hypotheses', 'followUpQuestions', 'missingEvidence', 'contradictoryEvidence',
+              'inferenceTrace', 'bfsSearchPath', 'bfsExploredLevels', 'recommendedSteps',
+              'safetyWarnings', 'riskLevel', 'urgencyLevel', 'nextRecommendedAction',
+              'confidenceScore', 'requiresProfessional', 'engineMode', 'summary',
+              'followUpConversation', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isValidId(diagnosisId) && isAdmin();
+    }
+
+    match /bookings/{bookingId} {
+      allow get: if isValidId(bookingId) && isSignedIn() && (
+        existing().customerId == request.auth.uid
+        || existing().technicianId == request.auth.uid
+        || isAdmin()
+      );
+
+      allow list: if isBootstrappedAdmin() || (
+        isSignedIn() && (
+          resource.data.customerId == request.auth.uid
+          || resource.data.technicianId == request.auth.uid
+        )
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(bookingId)
+        && isValidBooking(incoming())
+        && incoming().id == bookingId
+        && incoming().customerId == request.auth.uid
+        && incoming().status in ['requested', 'pending']
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isNotSuspended()
+        && exists(/databases/$(database)/documents/repairRequests/$(incoming().requestId))
+        && get(/databases/$(database)/documents/repairRequests/$(incoming().requestId)).data.customerId == request.auth.uid
+        && exists(/databases/$(database)/documents/technicians/$(incoming().technicianId))
+        && get(/databases/$(database)/documents/technicians/$(incoming().technicianId)).data.verificationStatus == 'verified'
+        && incoming().keys().hasAny(['slotKey'])
+        && isValidId(incoming().slotKey)
+        && existsAfter(/databases/$(database)/documents/bookingSlots/$(incoming().slotKey))
+        && getAfter(/databases/$(database)/documents/bookingSlots/$(incoming().slotKey)).data.bookingId == bookingId
+        && getAfter(/databases/$(database)/documents/bookingSlots/$(incoming().slotKey)).data.status == 'reserved';
+
+      allow update: if isVerifiedUser()
+        && isValidId(bookingId)
+        && isValidBooking(incoming())
+        && incoming().id == existing().id
+        && incoming().requestId == existing().requestId
+        && incoming().customerId == existing().customerId
+        && incoming().technicianId == existing().technicianId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            isNotSuspended()
+            && !(existing().status in ['completed', 'cancelled', 'rejected'])
+            && (
+              (
+                existing().customerId == request.auth.uid
+                && (
+                  (
+                    incoming().status == 'cancelled'
+                    && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt'])
+                  )
+                  || (
+                    existing().status in ['accepted', 'quotation_submitted']
+                    && incoming().status == 'confirmed'
+                    && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt'])
+                  )
+                  || (
+                    existing().status in ['requested', 'pending']
+                    && incoming().status == existing().status
+                    && incoming().diff(existing()).affectedKeys().hasOnly(['scheduledDate', 'timeSlot', 'slotKey', 'notes', 'updatedAt'])
+                  )
+                )
+              )
+              || (
+                existing().technicianId == request.auth.uid
+                && (
+                  (
+                    existing().status in ['requested', 'pending']
+                    && incoming().status in ['accepted', 'rejected']
+                    && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'rejectionReason', 'updatedAt'])
+                  )
+                  || (
+                    existing().status == 'accepted'
+                    && incoming().status == 'quotation_submitted'
+                    && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+                  )
+                  || (
+                    (
+                      (existing().status in ['accepted', 'confirmed'] && incoming().status == 'in_progress')
+                      || (existing().status == 'in_progress' && incoming().status == 'completed')
+                    )
+                    && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt'])
+                  )
+                )
+              )
+            )
+          )
+        );
+
+      allow delete: if isValidId(bookingId) && isAdmin();
+    }
+
+    match /bookingSlots/{slotKey} {
+      allow get: if isValidId(slotKey) && isSignedIn();
+      allow list: if isBootstrappedAdmin() || (isSignedIn() && resource.data.status == 'reserved');
+
+      allow create: if isVerifiedUser()
+        && isValidId(slotKey)
+        && isValidBookingSlotLock(incoming())
+        && incoming().id == slotKey
+        && incoming().customerId == request.auth.uid
+        && incoming().status == 'reserved'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isNotSuspended()
+        && existsAfter(/databases/$(database)/documents/bookings/$(incoming().bookingId));
+
+      allow update: if isVerifiedUser()
+        && isValidId(slotKey)
+        && isValidBookingSlotLock(incoming())
+        && incoming().id == existing().id
+        && incoming().technicianId == existing().technicianId
+        && incoming().scheduledDate == existing().scheduledDate
+        && incoming().timeSlot == existing().timeSlot
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            isNotSuspended()
+            && (
+              (
+                existing().status == 'released'
+                && incoming().status == 'reserved'
+                && incoming().customerId == request.auth.uid
+                && incoming().diff(existing()).affectedKeys().hasOnly(['bookingId', 'customerId', 'status', 'updatedAt'])
+                && existsAfter(/databases/$(database)/documents/bookings/$(incoming().bookingId))
+              )
+              || (
+                existing().status == 'reserved'
+                && incoming().status == 'released'
+                && incoming().bookingId == existing().bookingId
+                && incoming().customerId == existing().customerId
+                && (existing().customerId == request.auth.uid || existing().technicianId == request.auth.uid)
+                && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+              )
+            )
+          )
+        );
+
+      allow delete: if isValidId(slotKey) && isAdmin();
+    }
+
+    match /quotations/{quotationId} {
+      allow get: if isValidId(quotationId) && isSignedIn() && (
+        existing().customerId == request.auth.uid
+        || existing().technicianId == request.auth.uid
+        || isAdmin()
+      );
+      allow list: if isBootstrappedAdmin() || (
+        isSignedIn() && (
+          resource.data.customerId == request.auth.uid
+          || resource.data.technicianId == request.auth.uid
+        )
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(quotationId)
+        && isValidQuotation(incoming())
+        && incoming().id == quotationId
+        && incoming().technicianId == request.auth.uid
+        && incoming().status == 'pending'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isNotSuspended()
+        && exists(/databases/$(database)/documents/repairRequests/$(incoming().requestId))
+        && exists(/databases/$(database)/documents/technicians/$(request.auth.uid))
+        && get(/databases/$(database)/documents/technicians/$(request.auth.uid)).data.verificationStatus == 'verified';
+
+      allow update: if isVerifiedUser()
+        && isValidId(quotationId)
+        && isValidQuotation(incoming())
+        && incoming().id == existing().id
+        && incoming().requestId == existing().requestId
+        && incoming().customerId == existing().customerId
+        && incoming().technicianId == existing().technicianId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            isNotSuspended()
+            && !(existing().status in ['accepted', 'rejected', 'expired'])
+            && existing().customerId == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+            && incoming().status in ['accepted', 'rejected']
+          )
+        );
+
+      allow delete: if isValidId(quotationId) && isAdmin();
+    }
+
+    match /reviews/{reviewId} {
+      allow get: if isValidId(reviewId);
+      allow list: if resource.data.rating >= 1;
+
+      allow create: if isVerifiedUser()
+        && isValidId(reviewId)
+        && isValidReview(incoming())
+        && incoming().id == reviewId
+        && reviewId == 'rev_' + incoming().bookingId
+        && incoming().customerId == request.auth.uid
+        && !incoming().keys().hasAny(['technicianResponse', 'technicianRespondedAt'])
+        && incoming().createdAt == request.time
+        && isNotSuspended()
+        && exists(/databases/$(database)/documents/bookings/$(incoming().bookingId))
+        && get(/databases/$(database)/documents/bookings/$(incoming().bookingId)).data.customerId == request.auth.uid
+        && get(/databases/$(database)/documents/bookings/$(incoming().bookingId)).data.technicianId == incoming().technicianId
+        && get(/databases/$(database)/documents/bookings/$(incoming().bookingId)).data.status == 'completed';
+
+      allow update: if isVerifiedUser()
+        && isValidId(reviewId)
+        && isValidReview(incoming())
+        && incoming().id == existing().id
+        && incoming().bookingId == existing().bookingId
+        && incoming().customerId == existing().customerId
+        && incoming().technicianId == existing().technicianId
+        && incoming().createdAt == existing().createdAt
+        && (
+          isAdmin()
+          || (
+            isNotSuspended()
+            && existing().technicianId == request.auth.uid
+            && !('technicianResponse' in existing())
+            && incoming().diff(existing()).affectedKeys().hasOnly(['technicianResponse', 'technicianRespondedAt'])
+            && incoming().keys().hasAny(['technicianResponse', 'technicianRespondedAt'])
+            && incoming().technicianRespondedAt == request.time
+          )
+        );
+
+      allow delete: if isValidId(reviewId) && isAdmin();
+    }
+
+    match /notifications/{notificationId} {
+      allow get: if isValidId(notificationId) && isSignedIn() && (
+        existing().userId == request.auth.uid || isAdmin()
+      );
+      allow list: if isBootstrappedAdmin() || (
+        isSignedIn() && resource.data.userId == request.auth.uid
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(notificationId)
+        && isValidNotification(incoming())
+        && incoming().id == notificationId
+        && incoming().createdAt == request.time
+        && isNotSuspended()
+        && (
+          isAdmin()
+          || incoming().userId == request.auth.uid
+          || isValidCrossUserNotification()
+        );
+
+      allow update: if isVerifiedUser()
+        && isValidId(notificationId)
+        && isValidNotification(incoming())
+        && incoming().id == existing().id
+        && incoming().userId == existing().userId
+        && incoming().createdAt == existing().createdAt
+        && (
+          isAdmin()
+          || (
+            existing().userId == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly(['read'])
+          )
+        );
+
+      allow delete: if isValidId(notificationId) && (
+        (isSignedIn() && existing().userId == request.auth.uid) || isAdmin()
+      );
+    }
+
+    match /complaints/{complaintId} {
+      allow get: if isValidId(complaintId) && isSignedIn() && (
+        existing().reporterId == request.auth.uid || isAdmin()
+      );
+      allow list: if isBootstrappedAdmin() || (
+        isSignedIn() && resource.data.reporterId == request.auth.uid
+      );
+
+      allow create: if isVerifiedUser()
+        && isValidId(complaintId)
+        && isValidComplaint(incoming())
+        && incoming().id == complaintId
+        && incoming().reporterId == request.auth.uid
+        && incoming().status == 'open'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isNotSuspended();
+
+      allow update: if isVerifiedUser()
+        && isValidId(complaintId)
+        && isValidComplaint(incoming())
+        && incoming().id == existing().id
+        && incoming().reporterId == existing().reporterId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && isAdmin();
+
+      allow delete: if isValidId(complaintId) && isAdmin();
+    }
+
+    match /applianceCategories/{categoryId} {
+      allow get: if isValidId(categoryId);
+      allow list: if resource.data.isActive == true || isBootstrappedAdmin();
+      allow create: if isValidId(categoryId)
+        && isAdmin()
+        && isValidApplianceCategory(incoming())
+        && incoming().id == categoryId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(categoryId)
+        && isAdmin()
+        && isValidApplianceCategory(incoming())
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+      allow delete: if isValidId(categoryId) && isAdmin();
+    }
+
+    match /knowledgeBase/{entryId} {
+      allow get: if isValidId(entryId);
+      allow list: if resource.data.riskLevel in ['low', 'medium', 'high', 'critical'];
+      allow create: if isValidId(entryId)
+        && isAdmin()
+        && isValidKnowledgeBaseEntry(incoming())
+        && incoming().id == entryId
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(entryId)
+        && isAdmin()
+        && isValidKnowledgeBaseEntry(incoming())
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time;
+      allow delete: if isValidId(entryId) && isAdmin();
+    }
+
+    match /contactInquiries/{inquiryId} {
+      allow get: if isValidId(inquiryId) && isAdmin();
+      allow list: if isBootstrappedAdmin();
+      allow create: if isValidId(inquiryId)
+        && isValidContactInquiry(incoming())
+        && incoming().id == inquiryId
+        && incoming().status == 'new'
+        && incoming().createdAt == request.time;
+      allow update: if isValidId(inquiryId)
+        && isAdmin()
+        && isValidContactInquiry(incoming())
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(inquiryId) && isAdmin();
+    }
+  }
+}

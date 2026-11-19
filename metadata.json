@@ -1,0 +1,6 @@
+{
+  "name": "FixMate AI",
+  "description": "Diagnose Smarter. Repair Better. AI-powered appliance troubleshooting, fault knowledge representation, and verified repair technician platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
